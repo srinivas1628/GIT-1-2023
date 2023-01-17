@@ -1,0 +1,52 @@
+parameters:
+- name: serviceConnection
+  type: string
+- name: environment
+  type: string
+
+jobs:
+- deployment:
+  pool:
+    vmImage: 'windows-latest'
+  environment: ${{ parameters.environment }}
+  strategy:
+        runOnce:
+          deploy:
+            steps:              
+            - script: echo ${{ parameters.serviceConnection}} # uses macro syntax
+            - script: echo ${{ parameters.environment}} # uses macro syntax
+            - script: echo $(ResourceGroupName) # uses macro syntax
+            - script: echo $(WebAppName) # uses macro syntax
+
+            - task: AzurePowerShell@5
+              displayName: Adding WebAppAccessRule
+              inputs:
+                azureSubscription: '${{ parameters.serviceConnection}}'
+                ScriptType: 'InlineScript'
+                Inline: |
+                    $buildAgentIP = Invoke-RestMethod https://api.ipify.org/?format=json | Select -exp ip
+                    Write-Host("Build Agent IP Address: $($buildAgentIP)")
+                    Write-Host(($buildAgentIP + "/32"))
+                    Add-AzWebAppAccessRestrictionRule -ResourceGroupName "$(ResourceGroupName)" -WebAppName "$(WebAppName)" -Name ("IpRule" + $buildAgentIP) -Priority 100 -Action Allow -IpAddress ($buildAgentIP + "/32") -TargetScmSite
+                    Start-Sleep -Second 25
+                azurePowerShellVersion: 'LatestVersion'
+
+            - task: AzureRmWebAppDeployment@4
+              inputs:
+                ConnectionType: 'AzureRM'
+                azureSubscription: ${{ parameters.serviceConnection}}
+                appType: 'apiApp'
+                WebAppName: $(WebAppName)
+                packageForLinux: '$(Pipeline.Workspace)/**/*.zip'
+                JSONFiles: '**/appsettings.json'
+
+            - task: AzurePowerShell@5
+              displayName: Removing WebAppAccessRule
+              inputs:
+                azureSubscription: ${{ parameters.serviceConnection}}
+                ScriptType: 'InlineScript'
+                Inline: |
+                    $buildAgentIP = Invoke-RestMethod https://api.ipify.org/?format=json | Select -exp ip
+                    Write-Host("Build Agent IP Address: $($buildAgentIP)")
+                    Remove-AzWebAppAccessRestrictionRule -ResourceGroupName "$(ResourceGroupName)" -WebAppName "$(WebAppName)" -Name ("IpRule" + $buildAgentIP) -TargetScmSite
+                azurePowerShellVersion: 'LatestVersion'
