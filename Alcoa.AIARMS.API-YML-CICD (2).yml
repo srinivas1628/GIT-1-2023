@@ -1,0 +1,389 @@
+trigger:
+  branches:
+    include:
+    - main
+variables:
+- name: azureServiceConnection
+  value: 'RG-APP-DEV-AUA-AM-ARMS-SC'
+stages:
+- stage: Build
+  jobs:
+  - job: BuildArtifacts
+    workspace:
+      clean: outputs | resources | all
+    variables:
+    - name: buildConfiguration
+      value: 'Release'
+    pool:
+      vmImage: 'windows-latest'
+    steps:
+    - task: FileTransform@1
+      displayName: Filetransfer
+      inputs:
+        folderPath: '$(System.DefaultWorkingDirectory)/Alcoa.AIARMS.API/'
+        fileType: 'json'
+        targetFiles: 'appsettings.json'
+    - task: DotNetCoreCLI@2
+      inputs:
+        command: 'custom'
+        custom: 'new'
+        arguments: 'tool-manifest'
+    - task: DotNetCoreCLI@2
+      inputs:
+        command: 'restore'
+        projects: '**/*.csproj'
+        feedsToUse: 'select'
+    - task: DotNetCoreCLI@2
+      inputs:
+        command: 'build'
+        projects: '**/*.csproj'
+        arguments: '--configuration $(BuildConfiguration)'
+    - task: CmdLine@2
+      inputs:
+        script: 'dotnet tool install --global dotnet-ef --version 5.0.12'
+        workingDirectory: 'Alcoa.AIARMS.API'
+    - task: CmdLine@2
+      inputs:
+        script: 'dotnet ef migrations script -p Alcoa.AIARMS.API.csproj -o $(build.artifactstagingdirectory)\migrations\alarmsDbContext.sql -v -i --idempotent'
+        workingDirectory: 'Alcoa.AIARMS.API'
+    - task: DotNetCoreCLI@2
+      inputs:
+        command: 'test'
+        projects: '/[Tt]ests/.csproj'
+        arguments: '--configuration $(BuildConfiguration)'
+    - task: DotNetCoreCLI@2
+      inputs:
+        command: 'publish'
+        publishWebProjects: true
+        arguments: '--configuration $(BuildConfiguration) --output $(build.artifactstagingdirectory)'
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'drop'
+        publishLocation: 'Container'
+- stage: DeployDEV
+  displayName: Deploy to DEV
+  variables:
+  - name: group
+    value: 'YAML-Release-Dev'
+  - name: AzureAd.Scopes
+    value: "test_impersonation"
+  jobs:
+  - deployment: ''
+    pool:
+      vmImage: 'windows-latest'
+    environment:
+      name: 'dev'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: 30f35852-3f7e-4c0c-9a88-e127b4f97211@1
+            inputs:
+              alias: current
+              artifact: drop
+          - task: PowerShell@2
+            inputs:
+              targetType: 'inline'
+              script: 'get-childitem -path $(Pipeline.Workspace)\drop -recurse'
+          - task: AzureKeyVault@2
+            inputs:
+              azureSubscription: 'RG-APP-DEV-AUA-AM-ARMS-SC'
+              KeyVaultName: 'APP-DEV-AUA-AM-ARMS-KV'
+              SecretsFilter: '*'
+              RunAsPreJob: true
+          - task: AzurePowerShell@5
+            displayName: Adding IP to DB
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              ScriptType: 'InlineScript'
+              Inline: |
+                $buildAgentIP = Invoke-RestMethod https://api.ipify.org/?format=json | Select -exp ip
+                Write-Host("Build Agent IP Address: $($buildAgentIP)")
+                Write-Host(($buildAgentIP + "/32"))
+                New-AzSqlServerFirewallRule -ResourceGroupName "RG-APP-DEV-AUA-AM-ARMS" `
+                    -ServerName "app-dev-aua-am-arms-db-srv" `
+                    -FirewallRuleName "IpRule" -StartIpAddress $buildAgentIP -EndIpAddress $buildAgentIP
+
+                Start-Sleep -Second 25
+              preferredAzurePowerShellVersion: '3.1.0'
+          - task: SqlAzureDacpacDeployment@1
+            displayName: Azure SQL SqlTask
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              AuthenticationType: 'servicePrincipal'
+              ServerName: 'app-dev-aua-am-arms-db-srv.database.windows.net'
+              DatabaseName: 'APP-DEV-AUA-AM-ARMS-DB'
+              deployType: 'SqlTask'
+              SqlFile: '$(Pipeline.Workspace)/**/*.sql'
+              IpDetectionMethod: 'AutoDetect'
+          - task: AzurePowerShell@5
+            displayName: Removing IP to DB
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              ScriptType: 'InlineScript'
+              Inline: 'Remove-AzSqlServerFirewallRule -FirewallRuleName "IpRule" -ResourceGroupName "RG-APP-DEV-AUA-AM-ARMS" -ServerName "app-dev-aua-am-arms-db-srv"'
+              preferredAzurePowerShellVersion: '3.1.0'
+          - task: AzurePowerShell@5
+            displayName: Adding WebAppAccessRule
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              ScriptType: 'InlineScript'
+              Inline: "Install-Module -Name Az.Websites -Scope CurrentUser -Force\n$buildAgentIP = Invoke-RestMethod https://api.ipify.org/?format=json | Select -exp ip\nWrite-Host(\"Build Agent IP Address: $($buildAgentIP)\")\nWrite-Host(($buildAgentIP + \"/32\"))\nAdd-AzWebAppAccessRestrictionRule -ResourceGroupName \"RG-APP-DEV-AUA-AM-ARMS\" -WebAppName \"APP-DEV-AUA-AM-ARMS-API\" -Name (\"IpRule\" + $buildAgentIP) -Priority 100 -Action Allow -IpAddress ($buildAgentIP + \"/32\") -TargetScmSite\n                        \nStart-Sleep -Second 25\n"
+              preferredAzurePowerShellVersion: '3.1.0'
+          - task: AzureRmWebAppDeployment@4
+            inputs:
+              ConnectionType: 'AzureRM'
+              azureSubscription: '$(azureServiceConnection)'
+              appType: 'apiApp'
+              WebAppName: 'APP-DEV-AUA-AM-ARMS-API'
+              packageForLinux: '$(Pipeline.Workspace)/**/*.zip'
+              AppSettings: '-AuthSettings:Audience "https://aiarms.devapi.alcoa.com" -AuthSettings:Tenant "37a72eb7-1faf-49d3-9ddc-6b923b751bc0" -AuthSettings:Authority "https://login.microsoftonline.com/37a72eb7-1faf-49d3-9ddc-6b923b751bc0/" -DatabaseSettings:UseManagedIndentity "true" -CORSSettings:AllowedURLs "https://aiarms.devapps.alcoa.com"'
+          - task: AzurePowerShell@5
+            displayName: Removing WebAppAccessRule
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              ScriptType: 'InlineScript'
+              Inline: |
+                $buildAgentIP = Invoke-RestMethod https://api.ipify.org/?format=json | Select -exp ip
+
+                Remove-AzWebAppAccessRestrictionRule -ResourceGroupName "RG-APP-DEV-AUA-AM-ARMS" -WebAppName "APP-DEV-AUA-AM-ARMS-API" -Name ("IpRule" + $buildAgentIP) -TargetScmSite
+              azurePowerShellVersion: 'LatestVersion'
+- stage: DeployTest
+  displayName: Deploy to Test
+  variables:
+  - group: 'YAML-Release-Test'
+  jobs:
+  - deployment: ''
+    pool:
+      vmImage: 'windows-latest'
+    environment:
+      name: 'Test'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureKeyVault@2
+            inputs:
+              azureSubscription: 'RG-APP-TEST-AUA-AM-ARMS-SC'
+              KeyVaultName: 'APP-TEST-AUA-AM-ARMS-KV'
+              SecretsFilter: '*'
+              RunAsPreJob: true
+          - task: AzurePowerShell@5
+            displayName: Adding IP to DB
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              ScriptType: 'InlineScript'
+              Inline: |
+                $buildAgentIP = Invoke-RestMethod https://api.ipify.org/?format=json | Select -exp ip
+                Write-Host("Build Agent IP Address: $($buildAgentIP)")
+                Write-Host(($buildAgentIP + "/32"))
+                New-AzSqlServerFirewallRule -ResourceGroupName $(resourceGroupName) `
+                    -ServerName $(serverName) `
+                    -FirewallRuleName "IpRule" -StartIpAddress $buildAgentIP -EndIpAddress $buildAgentIP
+
+                Start-Sleep -Second 25
+              preferredAzurePowerShellVersion: '3.1.0'
+            enabled: true
+          - task: SqlAzureDacpacDeployment@1
+            displayName: Azure SQL SqlTask
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              AuthenticationType: 'servicePrincipal'
+              ServerName: $(sqlServerName)
+              DatabaseName: $(databaseName)
+              deployType: 'SqlTask'
+              SqlFile: '$(Pipeline.Workspace)/**/*.sql'
+              IpDetectionMethod: 'AutoDetect'
+          - task: AzurePowerShell@5
+            displayName: Removing IP to DB
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              ScriptType: 'InlineScript'
+              Inline: 'Remove-AzSqlServerFirewallRule -FirewallRuleName "IpRule" -ResourceGroupName $(resourceGroupName) -ServerName $(serverName)'
+              preferredAzurePowerShellVersion: '3.1.0'
+          - task: AzurePowerShell@5
+            displayName: Adding WebAppAccessRule
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              ScriptType: 'InlineScript'
+              Inline: "Install-Module -Name Az.Websites -Scope CurrentUser -Force\n$buildAgentIP = Invoke-RestMethod https://api.ipify.org/?format=json | Select -exp ip\nWrite-Host(\"Build Agent IP Address: $($buildAgentIP)\")\nWrite-Host(($buildAgentIP + \"/32\"))\nAdd-AzWebAppAccessRestrictionRule -ResourceGroupName '$(resourceGroupName)' -WebAppName '$(apiwebAppName)' -Name (\"IpRule\" + $buildAgentIP) -Priority 100 -Action Allow -IpAddress ($buildAgentIP + \"/32\") -TargetScmSite\n                        \nStart-Sleep -Second 25\n"
+              preferredAzurePowerShellVersion: '3.1.0'
+          - task: AzureRmWebAppDeployment@4
+            inputs:
+              ConnectionType: 'AzureRM'
+              azureSubscription: '$(azureServiceConnection)'
+              appType: 'apiApp'
+              WebAppName: '$(apiwebAppName)'
+              packageForLinux: '$(Pipeline.Workspace)/**/*.zip'
+              AppSettings: '-AuthSettings:Audience $(AuthSettings:Audience) -AuthSettings:Tenant $(AuthSettings:Tenant) -AuthSettings:Authority $(AuthSettings:Authority) -DatabaseSettings:UseManagedIndentity $(DatabaseSettings:UseManagedIndentity) -CORSSettings:AllowedURLs $(CORSSettings:AllowedURLs)'
+          - task: AzurePowerShell@5
+            displayName: Removing WebAppAccessRule
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              ScriptType: 'InlineScript'
+              Inline: |
+                $buildAgentIP = Invoke-RestMethod https://api.ipify.org/?format=json | Select -exp ip
+
+                Remove-AzWebAppAccessRestrictionRule -ResourceGroupName '$(resourceGroupName)' -WebAppName '$(apiwebAppName)' -Name ("IpRule" + $buildAgentIP) -TargetScmSite
+              azurePowerShellVersion: 'LatestVersion'
+- stage: DeployQA
+  displayName: Deploy to QA
+  variables:
+  - group: 'YAML-Release-QA'
+  jobs:
+  - deployment: ''
+    pool:
+      vmImage: 'windows-latest'
+    environment:
+      name: 'QA'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureKeyVault@2
+            inputs:
+              azureSubscription: 'RG-APP-QA-AUA-AM-ARMS-SC'
+              KeyVaultName: 'APP-QA-AUA-AM-ARMS-KV'
+              SecretsFilter: '*'
+              RunAsPreJob: true
+          - task: AzurePowerShell@5
+            displayName: Adding IP to DB
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              ScriptType: 'InlineScript'
+              Inline: |
+                $buildAgentIP = Invoke-RestMethod https://api.ipify.org/?format=json | Select -exp ip
+                Write-Host("Build Agent IP Address: $($buildAgentIP)")
+                Write-Host(($buildAgentIP + "/32"))
+                New-AzSqlServerFirewallRule -ResourceGroupName $(resourceGroupName) `
+                    -ServerName $(serverName) `
+                    -FirewallRuleName "IpRule" -StartIpAddress $buildAgentIP -EndIpAddress $buildAgentIP
+
+                Start-Sleep -Second 25
+              preferredAzurePowerShellVersion: '3.1.0'
+          - task: SqlAzureDacpacDeployment@1
+            displayName: Azure SQL SqlTask
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              AuthenticationType: 'servicePrincipal'
+              ServerName: $(sqlServerName)
+              DatabaseName: $(databaseName)
+              deployType: 'SqlTask'
+              SqlFile: '$(Pipeline.Workspace)/**/*.sql'
+              IpDetectionMethod: 'AutoDetect'
+          - task: AzurePowerShell@5
+            displayName: Removing IP to DB
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              ScriptType: 'InlineScript'
+              Inline: 'Remove-AzSqlServerFirewallRule -FirewallRuleName "IpRule" -ResourceGroupName $(resourceGroupName) -ServerName $(serverName)'
+              preferredAzurePowerShellVersion: '3.1.0'
+          - task: AzurePowerShell@5
+            displayName: Adding WebAppAccessRule
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              ScriptType: 'InlineScript'
+              Inline: "Install-Module -Name Az.Websites -Scope CurrentUser -Force\n$buildAgentIP = Invoke-RestMethod https://api.ipify.org/?format=json | Select -exp ip\nWrite-Host(\"Build Agent IP Address: $($buildAgentIP)\")\nWrite-Host(($buildAgentIP + \"/32\"))\nAdd-AzWebAppAccessRestrictionRule -ResourceGroupName '$(resourceGroupName)' -WebAppName '$(apiwebAppName)' -Name (\"IpRule\" + $buildAgentIP) -Priority 100 -Action Allow -IpAddress ($buildAgentIP + \"/32\") -TargetScmSite\n                        \nStart-Sleep -Second 25\n"
+              preferredAzurePowerShellVersion: '3.1.0'
+          - task: AzureRmWebAppDeployment@4
+            inputs:
+              ConnectionType: 'AzureRM'
+              azureSubscription: '$(azureServiceConnection)'
+              appType: 'apiApp'
+              WebAppName: '$(apiwebAppName)'
+              packageForLinux: '$(Pipeline.Workspace)/**/*.zip'
+              AppSettings: '-AuthSettings:Audience $(AuthSettings:Audience) -AuthSettings:Tenant $(AuthSettings:Tenant) -AuthSettings:Authority $(AuthSettings:Authority) -DatabaseSettings:UseManagedIndentity $(DatabaseSettings:UseManagedIndentity) -CORSSettings:AllowedURLs $(CORSSettings:AllowedURLs)'
+          - task: AzurePowerShell@5
+            displayName: Removing WebAppAccessRule
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              ScriptType: 'InlineScript'
+              Inline: |
+                $buildAgentIP = Invoke-RestMethod https://api.ipify.org/?format=json | Select -exp ip
+
+                Remove-AzWebAppAccessRestrictionRule -ResourceGroupName '$(resourceGroupName)' -WebAppName '$(apiwebAppName)' -Name ("IpRule" + $buildAgentIP) -TargetScmSite
+              azurePowerShellVersion: 'LatestVersion'
+- stage: DeployProd
+  displayName: Deploy to Prod
+  variables:
+  - group: 'YAML-Release-Prod'
+  jobs:
+  - deployment: ''
+    pool:
+      vmImage: 'windows-latest'
+    environment:
+      name: 'Prod'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: FileTransform@1
+            inputs:
+              folderPath: '$(System.DefaultWorkingDirectory)/Alcoa.AIARMS.API/'
+              fileType: 'json'
+              targetFiles: 'appsettings.PROD.json'
+          - task: AzureKeyVault@2
+            inputs:
+              azureSubscription: 'RG-APP-PROD-AUA-AM-ARMS-SC'
+              KeyVaultName: 'APP-PROD-AUA-AM-ARMS-KV'
+              SecretsFilter: '*'
+              RunAsPreJob: false
+          - task: AzurePowerShell@5
+            displayName: Adding IP to DB
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              ScriptType: 'InlineScript'
+              Inline: |
+                $buildAgentIP = Invoke-RestMethod https://api.ipify.org/?format=json | Select -exp ip
+                Write-Host("Build Agent IP Address: $($buildAgentIP)")
+                Write-Host(($buildAgentIP + "/32"))
+                New-AzSqlServerFirewallRule -ResourceGroupName $(resourceGroupName) `
+                    -ServerName $(serverName) `
+                    -FirewallRuleName "IpRule" -StartIpAddress $buildAgentIP -EndIpAddress $buildAgentIP
+
+                Start-Sleep -Second 25
+              preferredAzurePowerShellVersion: '3.1.0'
+          - task: SqlAzureDacpacDeployment@1
+            displayName: Azure SQL SqlTask
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              AuthenticationType: 'servicePrincipal'
+              ServerName: $(sqlServerName)
+              DatabaseName: $(databaseName)
+              deployType: 'SqlTask'
+              SqlFile: '$(Pipeline.Workspace)/**/*.sql'
+              IpDetectionMethod: 'AutoDetect'
+          - task: AzurePowerShell@5
+            displayName: Removing IP to DB
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              ScriptType: 'InlineScript'
+              Inline: 'Remove-AzSqlServerFirewallRule -FirewallRuleName "IpRule" -ResourceGroupName $(resourceGroupName) -ServerName $(serverName)'
+              preferredAzurePowerShellVersion: '3.1.0'
+          - task: AzurePowerShell@5
+            displayName: Adding WebAppAccessRule
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              ScriptType: 'InlineScript'
+              Inline: "Install-Module -Name Az.Websites -Scope CurrentUser -Force\n$buildAgentIP = Invoke-RestMethod https://api.ipify.org/?format=json | Select -exp ip\nWrite-Host(\"Build Agent IP Address: $($buildAgentIP)\")\nWrite-Host(($buildAgentIP + \"/32\"))\nAdd-AzWebAppAccessRestrictionRule -ResourceGroupName '$(resourceGroupName)' -WebAppName '$(apiwebAppName)' -Name (\"IpRule\" + $buildAgentIP) -Priority 100 -Action Allow -IpAddress ($buildAgentIP + \"/32\") -TargetScmSite\n                        \nStart-Sleep -Second 25\n"
+              preferredAzurePowerShellVersion: '3.1.0'
+          - task: AzureRmWebAppDeployment@4
+            inputs:
+              ConnectionType: 'AzureRM'
+              azureSubscription: '$(azureServiceConnection)'
+              appType: 'apiApp'
+              WebAppName: '$(apiwebAppName)'
+              packageForLinux: '$(Pipeline.Workspace)/**/*.zip'
+              AppSettings: '-AuthSettings:Audience $(AuthSettings:Audience) -AuthSettings:Tenant $(AuthSettings:Tenant) -AuthSettings:Authority $(AuthSettings:Authority) -DatabaseSettings:UseManagedIndentity $(DatabaseSettings:UseManagedIndentity) -CORSSettings:AllowedURLs $(CORSSettings:AllowedURLs)'
+          - task: AzurePowerShell@5
+            displayName: Removing WebAppAccessRule
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              ScriptType: 'InlineScript'
+              Inline: |
+                $buildAgentIP = Invoke-RestMethod https://api.ipify.org/?format=json | Select -exp ip
+
+                Remove-AzWebAppAccessRestrictionRule -ResourceGroupName '$(resourceGroupName)' -WebAppName '$(apiwebAppName)' -Name ("IpRule" + $buildAgentIP) -TargetScmSite
+              azurePowerShellVersion: 'LatestVersion'
+
